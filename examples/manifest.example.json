@@ -1,0 +1,35 @@
+{
+  "name": "example-pyramid",
+  "width": 512,
+  "height": 512,
+  "tileSize": 256,
+  "layers": [
+    {
+      "level": 0,
+      "width": 512,
+      "height": 512,
+      "tiles": [
+        { "col": 0, "row": 0, "file": "tiles/l0/0_0.png" },
+        { "col": 1, "row": 0, "file": "tiles/l0/0_1.png" },
+        { "col": 0, "row": 1, "file": "tiles/l0/1_0.png" },
+        { "col": 1, "row": 1, "file": "tiles/l0/1_1.png" }
+      ]
+    },
+    {
+      "level": 1,
+      "width": 256,
+      "height": 256,
+      "tiles": [
+        { "col": 0, "row": 0, "file": "tiles/l1/0_0.png" }
+      ]
+    },
+    {
+      "level": 2,
+      "width": 128,
+      "height": 128,
+      "tiles": [
+        { "col": 0, "row": 0, "width": 128, "height": 128, "file": "tiles/l2/0_0.png" }
+      ]
+    }
+  ]
+}

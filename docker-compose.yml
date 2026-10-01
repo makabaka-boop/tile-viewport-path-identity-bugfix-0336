@@ -1,0 +1,29 @@
+# 多分辨率瓦片图像工作台
+#
+# 固定验收依次执行：
+#   docker compose config --quiet
+#   docker compose build
+#   docker compose run --rm verify
+#
+# web    ：构建产物的静态服务（nginx），默认 http://localhost:8080
+# verify ：一次性测试服务（类型检查 + Vitest），结束即退出
+
+services:
+  web:
+    build:
+      context: .
+      dockerfile: Dockerfile
+      target: web
+    image: image-workbench-web:latest
+    ports:
+      - "8080:80"
+    restart: unless-stopped
+
+  verify:
+    build:
+      context: .
+      dockerfile: Dockerfile
+      target: verify-base
+    image: image-workbench-verify:latest
+    # 一次性：类型检查 + 单元测试，退出码即验收结果
+    command: ["sh", "-lc", "npm run typecheck && npm run test"]
