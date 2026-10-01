@@ -93,7 +93,11 @@ function drawSlot(ctx: CanvasRenderingContext2D, slot: SlotView, bitmap: Decoded
     return
   }
 
-  // loading（含 error）
+  // loading（含 error）。副标题优先显示真正提供像素的本地文件（与 manifest
+  // 引用路径不同时给出「manifest 路径 <- 本地文件」的完整来源链）。
+  const sourceLabel = slot.resolvedFile && slot.resolvedFile !== slot.file
+    ? `${slot.file} ← ${slot.resolvedFile}`
+    : (slot.resolvedFile ?? slot.file ?? '')
   drawPlaceholder(
     ctx,
     x,
@@ -101,8 +105,8 @@ function drawSlot(ctx: CanvasRenderingContext2D, slot: SlotView, bitmap: Decoded
     sw,
     sh,
     slot.error
-      ? { fill: '#3a2020', hatch: '#6e2f2f', label: '解码失败', sub: slot.file ?? '', color: '#f0a0a0' }
-      : { fill: '#1d2430', hatch: '#2c3a4f', label: '解码中…', sub: slot.file ?? '', color: '#8fb4e6' }
+      ? { fill: '#3a2020', hatch: '#6e2f2f', label: '解码失败', sub: sourceLabel, color: '#f0a0a0' }
+      : { fill: '#1d2430', hatch: '#2c3a4f', label: '解码中…', sub: sourceLabel, color: '#8fb4e6' }
   )
 }
 

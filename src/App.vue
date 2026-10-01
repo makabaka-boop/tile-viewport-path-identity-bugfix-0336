@@ -74,17 +74,21 @@ async function tryImport(): Promise<void> {
     })
   }
   if (res.ambiguous.length > 0) {
+    const detail = res.ambiguous
+      .slice(0, 4)
+      .map((a) => `${a.ref}（候选：${a.candidates.slice(0, 3).join(' / ')}${a.candidates.length > 3 ? ' …' : ''}）`)
+      .join('；')
     issues.push({
       severity: 'warning',
       code: 'files.ambiguous',
-      message: `${res.ambiguous.length} 个引用存在同名文件，按缺失处理：${res.ambiguous.slice(0, 4).join(', ')}`
+      message: `${res.ambiguous.length} 个引用匹配到多个本地文件，无法确定归属，按缺失显示占位：${detail}${res.ambiguous.length > 4 ? ' …' : ''}`
     })
   }
   if (res.unused.length > 0) {
     issues.push({
       severity: 'warning',
       code: 'files.unused',
-      message: `${res.unused.length} 个所选文件未被 manifest 引用`
+      message: `${res.unused.length} 个所选文件未被 manifest 引用：${res.unused.slice(0, 4).join(', ')}${res.unused.length > 4 ? ' …' : ''}`
     })
   }
   loadIssues.value = issues

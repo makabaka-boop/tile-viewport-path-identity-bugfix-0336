@@ -1,7 +1,7 @@
 import { describe, expect, it } from 'vitest'
 import { normalizeFilePath, parseManifest, resolveFiles } from '../src/core/manifest'
 import type { ManifestJSON } from '../src/core/types'
-import { makeFile } from './helpers'
+import { makeDirFile, makeFile } from './helpers'
 
 function tiles2x2(filePrefix: string): ManifestJSON['layers'][number]['tiles'] {
   // 512×512 图像，256 瓦片 => 2×2
@@ -31,11 +31,42 @@ describe('manifest 路径归一化', () => {
     expect(normalizeFilePath('a/b\\c.png')).toBe('a/b/c.png')
     expect(normalizeFilePath('./x.png')).toBe('x.png')
   })
+  it('折叠路径中任意位置的 . 片段（等价路径归一化为同一结果）', () => {
+    expect(normalizeFilePath('tiles/./l0/0_0.png')).toBe('tiles/l0/0_0.png')
+    expect(normalizeFilePath('./a/./b.png')).toBe('a/b.png')
+    expect(normalizeFilePath('a/././b.png')).toBe('a/b.png')
+  })
   it('拒绝绝对路径与 .. 越界', () => {
     expect(normalizeFilePath('/etc/passwd')).toBeNull()
     expect(normalizeFilePath('../x.png')).toBeNull()
     expect(normalizeFilePath('a/../b.png')).toBeNull()
     expect(normalizeFilePath('')).toBeNull()
+    expect(normalizeFilePath('.')).toBeNull()
+    expect(normalizeFilePath('a//b.png')).toBeNull()
+    expect(normalizeFilePath('a/')).toBeNull()
+  })
+})
+
+describe('等价目录片段不得绕过文件唯一性', () => {
+  it('tiles/./l0/0_0.png 与 tiles/l0/0_0.png 判为同一文件', () => {
+    const m: ManifestJSON = {
+      width: 512,
+      height: 256,
+      layers: [
+        {
+          level: 0,
+          width: 512,
+          height: 256,
+          tiles: [
+            { col: 0, row: 0, file: 'tiles/./l0/0_0.png' },
+            { col: 1, row: 0, width: 256, height: 256, file: 'tiles/l0/0_0.png' }
+          ]
+        }
+      ]
+    }
+    const r = parseManifest(m)
+    expect(r.manifest).toBeNull()
+    expect(r.issues.some((i) => i.code === 'tile.duplicate_file')).toBe(true)
   })
 })
 
@@ -161,7 +192,9 @@ describe('本地文件解析（不上传内容）', () => {
     const res = resolveFiles(parsed.manifest!, [makeFile('0_0.png')])
     expect(res.byPath.size).toBe(0)
     expect(res.missing.sort()).toEqual(['L0/0_0.png', 'L1/0_0.png'])
-    expect(res.ambiguous.length).toBe(2)
+    expect(res.ambiguous.map((a) => a.ref).sort()).toEqual(['L0/0_0.png', 'L1/0_0.png'])
+    // 卷入歧义的唯一文件不应再被计为「多余文件」
+    expect(res.unused).toEqual([])
   })
 
   it('多余文件列入 unused', () => {
@@ -177,5 +210,80 @@ describe('本地文件解析（不上传内容）', () => {
     expect(res.byPath.size).toBe(5)
     expect(res.missing).toEqual([])
     expect(res.unused).toEqual(['random.txt'])
+  })
+})
+
+describe('父目录下两套末尾路径相同的瓦片树', () => {
+  function singleTileManifest(): ManifestJSON {
+    return {
+      width: 256,
+      height: 256,
+      layers: [
+        { level: 0, width: 256, height: 256, tiles: [{ col: 0, row: 0, file: 'tiles/l0/0_0.png' }] }
+      ]
+    }
+  }
+
+  it('改变浏览器返回文件的顺序，解析结果完全一致：按歧义/缺失处理而非静默选一套', () => {
+    const { manifest } = parseManifest(singleTileManifest())
+    const fromA = makeDirFile('imports/A/tiles/l0/0_0.png')
+    const fromB = makeDirFile('imports/B/tiles/l0/0_0.png')
+
+    const r1 = resolveFiles(manifest!, [fromA, fromB])
+    const r2 = resolveFiles(manifest!, [fromB, fromA])
+
+    for (const r of [r1, r2]) {
+      expect(r.byPath.size).toBe(0)
+      expect(r.missing).toEqual(['tiles/l0/0_0.png'])
+      expect(r.ambiguous).toHaveLength(1)
+      expect(r.ambiguous[0].ref).toBe('tiles/l0/0_0.png')
+      expect(r.ambiguous[0].candidates.sort()).toEqual([
+        'imports/A/tiles/l0/0_0.png',
+        'imports/B/tiles/l0/0_0.png'
+      ])
+      // 两个候选都不是「多余文件」——它们正是无法消歧的来源
+      expect(r.unused).toEqual([])
+    }
+  })
+
+  it('只导入一套瓦片树时正常唯一命中（不因后缀机制误报歧义）', () => {
+    const { manifest } = parseManifest(singleTileManifest())
+    const f = makeDirFile('shoot-2026/tiles/l0/0_0.png')
+    const r = resolveFiles(manifest!, [f])
+    expect(r.byPath.get('tiles/l0/0_0.png')).toBe(f)
+    expect(r.missing).toEqual([])
+    expect(r.ambiguous).toEqual([])
+    expect(r.unused).toEqual([])
+  })
+
+  it('一套目录树 + 一个平铺同名文件：目录路径信息优先唯一归属，平铺文件列为多余（顺序无关）', () => {
+    const { manifest } = parseManifest(singleTileManifest())
+    const dir = makeDirFile('A/tiles/l0/0_0.png')
+    const flat = makeFile('0_0.png')
+    const r1 = resolveFiles(manifest!, [dir, flat])
+    const r2 = resolveFiles(manifest!, [flat, dir])
+    for (const r of [r1, r2]) {
+      expect(r.byPath.size).toBe(1)
+      expect(r.byPath.get('tiles/l0/0_0.png')).toBe(dir)
+      expect(r.ambiguous).toEqual([])
+      expect(r.unused).toEqual(['0_0.png'])
+    }
+  })
+
+  it('两层引用后缀相同、磁盘仅一个文件同时满足 => 歧义（不能把同一像素同时判给两处）', () => {
+    const m: ManifestJSON = {
+      width: 256,
+      height: 256,
+      layers: [
+        { level: 0, width: 256, height: 256, tiles: [{ col: 0, row: 0, file: 'l0/0_0.png' }] },
+        { level: 1, width: 128, height: 128, tiles: [{ col: 0, row: 0, width: 128, height: 128, file: 'l1/0_0.png' }] }
+      ]
+    }
+    const parsed = parseManifest(m)
+    // 一个很深的目录文件，其路径后缀同时包含 l0/0_0.png 与 l1/0_0.png 不可能，
+    // 但平铺选择的单文件 basename 兜底正是这个形态：
+    const res = resolveFiles(parsed.manifest!, [makeFile('0_0.png')])
+    expect(res.byPath.size).toBe(0)
+    expect(res.ambiguous.map((a) => a.ref).sort()).toEqual(['l0/0_0.png', 'l1/0_0.png'])
   })
 })

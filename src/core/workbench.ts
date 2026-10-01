@@ -18,6 +18,7 @@ import {
 import { TileScheduler } from './scheduler'
 import type { TileRequest } from './decoder'
 import { chooseLevel, visibleSlots, type TileSlot } from './levels'
+import { fileDisplayName } from './manifest'
 import type {
   DecodeState,
   ImageRect,
@@ -36,7 +37,10 @@ export interface SlotView extends TileSlot {
   level: number
   key: string
   state: DecodeState
+  /** manifest 中记录的引用路径。 */
   file: string | null
+  /** 实际提供像素的本地文件展示名（目录选择时为 webkitRelativePath）；缺失为 null。 */
+  resolvedFile: string | null
   error: boolean
 }
 
@@ -276,6 +280,7 @@ export class Workbench {
         key,
         state,
         file: tile?.file ?? null,
+        resolvedFile: file ? fileDisplayName(file) : null,
         error
       }
     })
@@ -310,6 +315,12 @@ export class Workbench {
   /**
    * 导出当前框选为原图坐标 JSON。
    * 无有效选择时返回 null。
+   *
+   * 每个 level 0 瓦片同时记录：
+   * - `file`：manifest 中声明的引用路径（与 manifest 内容严格一致，不做改写）；
+   * - `resolvedFile` / `resolvedSize`：导入时实际解析到、画布上真正显示像素的
+   *   本地文件展示名与字节数；缺失时为 null。两者并列才能解释「显示的像素」
+   *   与「manifest 引用」是否一致。
    */
   exportSelection(): ExportResult | null {
     const rect = this.selection
@@ -323,7 +334,7 @@ export class Workbench {
         width: round6(rect.width),
         height: round6(rect.height)
       },
-      level0Tiles: tilesForRect(this.manifest, rect)
+      level0Tiles: tilesForRect(this.manifest, rect, this.files)
     }
     return { json: JSON.stringify(payload, null, 2), rect }
   }
@@ -351,19 +362,42 @@ function normalizeRect(r: ImageRect, maxW: number, maxH: number): ImageRect {
 
 function tilesForRect(
   manifest: NormalizedManifest,
-  rect: ImageRect
-): Array<{ level: number; col: number; row: number; file: string | null }> {
+  rect: ImageRect,
+  files: Map<string, File>
+): Array<{
+  level: number
+  col: number
+  row: number
+  file: string | null
+  resolvedFile: string | null
+  resolvedSize: number | null
+}> {
   const base = manifest.layers.find((l) => l.level === 0) ?? manifest.layers[0]
   const ts = base.tileSize
   const c0 = Math.max(0, Math.floor(rect.x / ts))
   const r0 = Math.max(0, Math.floor(rect.y / ts))
   const c1 = Math.min(base.cols - 1, Math.floor((rect.x + rect.width) / ts))
   const r1 = Math.min(base.rows - 1, Math.floor((rect.y + rect.height) / ts))
-  const out: Array<{ level: number; col: number; row: number; file: string | null }> = []
+  const out: Array<{
+    level: number
+    col: number
+    row: number
+    file: string | null
+    resolvedFile: string | null
+    resolvedSize: number | null
+  }> = []
   for (let row = r0; row <= r1; row++) {
     for (let col = c0; col <= c1; col++) {
       const tile = base.tiles.get(`${col}:${row}`)
-      out.push({ level: 0, col, row, file: tile?.file ?? null })
+      const resolved = tile ? files.get(tile.file) ?? null : null
+      out.push({
+        level: 0,
+        col,
+        row,
+        file: tile?.file ?? null,
+        resolvedFile: resolved ? fileDisplayName(resolved) : null,
+        resolvedSize: resolved ? resolved.size : null
+      })
     }
   }
   return out

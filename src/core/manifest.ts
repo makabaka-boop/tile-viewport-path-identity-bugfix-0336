@@ -24,14 +24,24 @@ function isInt(v: unknown): v is number {
   return typeof v === 'number' && Number.isInteger(v)
 }
 
-/** 将 manifest 中的路径归一化为相对、正斜杠形式；绝对路径 / `..` 越界返回 null。 */
+/**
+ * 将 manifest 中的路径归一化为相对、正斜杠形式；绝对路径 / `..` 越界、
+ * 空片段（`a//b`、`a/`）返回 null。
+ *
+ * 所有等价的「当前目录」片段都会被折叠（包括路径中间的 `.`），因此
+ * `tiles/./l0/0_0.png` 与 `./tiles/l0/0_0.png` 归一化结果一致——否则同一路径
+ * 的不同等价写法会绕过全局唯一性检查，也无法与本地文件正确配对。
+ */
 export function normalizeFilePath(raw: string): string | null {
-  const p = raw.replace(/\\/g, '/').replace(/^\.\//, '')
-  if (p.length === 0) return null
-  if (p.startsWith('/')) return null
-  const parts = p.split('/')
+  const p = raw.replace(/\\/g, '/')
+  if (p.length === 0 || p.startsWith('/')) return null
+  const rawParts = p.split('/')
+  // 空片段（a//b、a/、/a 之外的尾斜杠等）一律拒绝，不做静默折叠。
+  if (rawParts.some((seg) => seg.length === 0)) return null
+  // 仅折叠等价的当前目录片段，保证等价写法归一化为同一结果。
+  const parts = rawParts.filter((seg) => seg !== '.')
+  if (parts.length === 0) return null
   if (parts.some((seg) => seg === '..')) return null
-  if (parts.some((seg) => seg.length === 0)) return null
   return parts.join('/')
 }
 
@@ -269,14 +279,21 @@ export function parseManifest(raw: unknown): ManifestParseResult {
   }
 }
 
+export interface AmbiguousRef {
+  /** manifest 引用路径。 */
+  ref: string
+  /** 无法确定归属的候选本地文件展示名（webkitRelativePath，无目录信息时为 basename）。 */
+  candidates: string[]
+}
+
 export interface ResolvedFiles {
   /** manifest 文件路径 => 用户选择的本地文件；缺失瓦片不在此表中。 */
   byPath: Map<string, File>
   /** 被引用但未在所选文件中找到的路径（查看器显示占位）。 */
   missing: string[]
-  /** basename 匹配到多个文件、无法确定的引用路径。 */
-  ambiguous: string[]
-  /** 已选择但未被任何瓦片引用的文件名。 */
+  /** 匹配到多个候选、无法唯一确定归属的引用；按缺失处理。 */
+  ambiguous: AmbiguousRef[]
+  /** 已选择但未被任何瓦片引用、也未卷入任何歧义的文件名。 */
   unused: string[]
 }
 
@@ -285,71 +302,157 @@ function webkitRelativePathOf(f: File): string {
   return typeof rel === 'string' ? rel.replace(/\\/g, '/') : ''
 }
 
+/** 本地文件的展示名：目录选择时保留浏览器给出的相对路径，否则为 basename。 */
+export function fileDisplayName(f: File): string {
+  return webkitRelativePathOf(f) || f.name
+}
+
+interface IndexedFile {
+  file: File
+  display: string
+  /** 目录选择时的相对路径（如 setA/tiles/l0/0_0.png），平铺选择为空。 */
+  rel: string
+  /** rel 的全部后缀（含完整 rel 自身），平铺选择为空数组。 */
+  suffixes: string[]
+  base: string
+}
+
+function indexFiles(files: File[]): IndexedFile[] {
+  return files.map((file) => {
+    const rel = webkitRelativePathOf(file)
+    const parts = rel ? rel.split('/') : []
+    const suffixes: string[] = []
+    for (let idx = 0; idx < parts.length; idx++) {
+      suffixes.push(parts.slice(idx).join('/'))
+    }
+    return { file, display: rel || file.name, rel, suffixes, base: file.name }
+  })
+}
+
+/**
+ * 二分匹配（引用 <=> 本地文件），按连通分量消歧：
+ * - 恰好 1 个引用 + 1 个候选 => 唯一归属；
+ * - 其余任何形态（多个候选、多个引用共享同一文件）=> 整组引用按缺失处理，
+ *   整组文件标记为「卷入歧义」，不计入 unused。
+ *
+ * 结果只取决于边的集合，与浏览器返回文件 / 遍历引用的顺序完全无关——
+ * 否则从父目录导入两套末尾路径相同的瓦片树时，仅改变文件顺序就会让画布
+ * 静默显示另一套瓦片的像素。
+ */
+function resolveByEdges(
+  refs: string[],
+  indexed: IndexedFile[],
+  hasEdge: (ref: string, item: IndexedFile) => boolean
+): { assigned: Map<string, File>; ambiguous: AmbiguousRef[]; quarantined: Set<File> } {
+  const assigned = new Map<string, File>()
+  const ambiguous: AmbiguousRef[] = []
+  const quarantined = new Set<File>()
+  if (refs.length === 0 || indexed.length === 0) return { assigned, ambiguous, quarantined }
+
+  // 邻接表：引用侧节点 r<i>，文件侧节点 f<i>。
+  const refAdj = refs.map((ref) => {
+    const out: number[] = []
+    indexed.forEach((item, fi) => {
+      if (hasEdge(ref, item)) out.push(fi)
+    })
+    return out
+  })
+  const fileAdj = indexed.map(() => [] as number[])
+  refAdj.forEach((neighbors, ri) => {
+    for (const fi of neighbors) fileAdj[fi].push(ri)
+  })
+
+  const visited = new Set<string>()
+  for (let ri = 0; ri < refs.length; ri++) {
+    const root = `r${ri}`
+    if (visited.has(root)) continue
+    const compRefs = new Set<number>()
+    const compFiles = new Set<number>()
+    const stack: Array<{ side: 'r' | 'f'; i: number }> = [{ side: 'r', i: ri }]
+    while (stack.length) {
+      const node = stack.pop()!
+      const key = `${node.side}${node.i}`
+      if (visited.has(key)) continue
+      visited.add(key)
+      if (node.side === 'r') {
+        compRefs.add(node.i)
+        for (const fi of refAdj[node.i]) {
+          if (!visited.has(`f${fi}`)) stack.push({ side: 'f', i: fi })
+        }
+      } else {
+        compFiles.add(node.i)
+        for (const otherRi of fileAdj[node.i]) {
+          if (!visited.has(`r${otherRi}`)) stack.push({ side: 'r', i: otherRi })
+        }
+      }
+    }
+
+    if (compRefs.size === 1 && compFiles.size === 1) {
+      const onlyRef = [...compRefs][0]
+      const onlyFile = [...compFiles][0]
+      assigned.set(refs[onlyRef], indexed[onlyFile].file)
+    } else if (compFiles.size > 0) {
+      // 有候选但无法一一对应（多候选 / 多引用共享同一文件）=> 歧义。
+      // 候选为 0 的分量只是「缺失」，不在这里报告（由 missing 体现）。
+      const fileItems = [...compFiles].map((fi) => indexed[fi])
+      const candidates = fileItems.map((it) => it.display).sort()
+      for (const fi of compFiles) quarantined.add(indexed[fi].file)
+      for (const r of compRefs) {
+        ambiguous.push({ ref: refs[r], candidates })
+      }
+    }
+  }
+  return { assigned, ambiguous, quarantined }
+}
+
 /**
  * 将归一化 manifest 引用的路径解析到用户选择的本地文件。绝不读取文件内容，
- * 仅按相对路径 / 文件名匹配。缺失条目以 missing 路径返回（查看器显示占位）。
+ * 仅按相对路径后缀 / basename 匹配。匹配对文件与引用的遍历顺序完全不敏感：
+ * 命中多候选时一律按缺失处理并报告歧义，而不是静默挑中顺序上的第一个文件。
  */
 export function resolveFiles(manifest: NormalizedManifest, files: File[]): ResolvedFiles {
   const referenced = new Set<string>()
   manifest.layers.forEach((l) => l.tiles.forEach((t) => referenced.add(t.file)))
+  const allRefs = [...referenced].sort()
+  const indexed = indexFiles(files)
 
-  // 以「相对路径后缀」索引（兼容目录选择产生的 webkitRelativePath），再以 basename 兜底。
-  const byRel = new Map<string, File>()
-  const byBase = new Map<string, File[]>()
-  for (const f of files) {
-    const rel = webkitRelativePathOf(f)
-    if (rel) {
-      const parts = rel.split('/')
-      // a/b/c.png 注册 b/c.png 与 c.png 两个后缀
-      for (let idx = 1; idx < parts.length; idx++) {
-        const suffix = parts.slice(idx).join('/')
-        if (!byRel.has(suffix)) byRel.set(suffix, f)
-      }
-    }
-    if (!byRel.has(f.name)) byRel.set(f.name, f)
+  // 第一轮：路径级匹配。
+  // - 目录选择：引用必须是 webkitRelativePath 的后缀（完整 rel 也注册为后缀）；
+  // - 平铺选择：仅允许 basename 全等。
+  // 多个文件结尾路径相同时（父目录下两套瓦片树），连通分量为 1 引用 × N 文件
+  // => 歧义，按缺失处理，候选文件不计入 unused。
+  const phase1 = resolveByEdges(allRefs, indexed, (ref, item) => {
+    if (item.rel) return item.suffixes.includes(ref)
+    return item.base === ref
+  })
 
-    const list = byBase.get(f.name)
-    if (list) list.push(f)
-    else byBase.set(f.name, [f])
-  }
-
-  const byPath = new Map<string, File>()
-  const missing: string[] = []
-  const ambiguous: string[] = []
-
-  // 第一轮：相对路径后缀精确匹配。
-  for (const ref of referenced) {
-    const exact = byRel.get(ref)
-    if (exact) byPath.set(ref, exact)
-  }
-
-  // 第二轮：仅对未命中的引用做 basename 兜底。
-  // 同一 basename 若被多个引用共用且无路径级信息消歧，则无法确定归属 => ambiguous。
-  const baseRefCount = new Map<string, number>()
-  for (const ref of referenced) {
+  // 第二轮：仅对仍未命中的引用做 basename 兜底，候选排除已唯一分配 /
+  // 已卷入路径级歧义的文件。两个引用共用同一 basename 时同样以连通分量消歧。
+  const assignedPhase1 = new Set<File>(phase1.assigned.values())
+  const remaining = allRefs.filter((ref) => !phase1.assigned.has(ref))
+  const available = indexed.filter(
+    (item) => !assignedPhase1.has(item.file) && !phase1.quarantined.has(item.file)
+  )
+  const phase2 = resolveByEdges(remaining, available, (ref, item) => {
     const base = ref.split('/').pop() ?? ref
-    baseRefCount.set(base, (baseRefCount.get(base) ?? 0) + 1)
-  }
+    return item.base === base
+  })
 
-  for (const ref of referenced) {
-    if (byPath.has(ref)) continue
-    const base = ref.split('/').pop() ?? ref
-    const candidates = byBase.get(base) ?? []
-    if ((baseRefCount.get(base) ?? 0) > 1) {
-      ambiguous.push(ref)
-      missing.push(ref)
-    } else if (candidates.length === 0) {
-      missing.push(ref)
-    } else if (candidates.length > 1) {
-      ambiguous.push(ref)
-      missing.push(ref)
-    } else {
-      byPath.set(ref, candidates[0])
-    }
-  }
+  const byPath = new Map<string, File>(phase1.assigned)
+  for (const [ref, file] of phase2.assigned) byPath.set(ref, file)
 
-  const usedFiles = new Set<File>(byPath.values())
-  const unused = files.filter((f) => !usedFiles.has(f)).map((f) => f.name)
+  const ambiguous = [...phase1.ambiguous, ...phase2.ambiguous].sort((a, b) =>
+    a.ref < b.ref ? -1 : a.ref > b.ref ? 1 : 0
+  )
+  const quarantined = new Set<File>([...phase1.quarantined, ...phase2.quarantined])
+
+  const missing = allRefs.filter((ref) => !byPath.has(ref)).sort()
+  // 歧义引用同时落在 missing 中（画布显示占位）；ambiguous 提供候选明细。
+
+  const assignedFiles = new Set<File>(byPath.values())
+  const unused = files
+    .filter((f) => !assignedFiles.has(f) && !quarantined.has(f))
+    .map((f) => f.name)
 
   return { byPath, missing, ambiguous, unused }
 }

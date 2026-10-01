@@ -91,6 +91,14 @@ export function makeFile(name: string, bytes = 1): File {
   return { name } as unknown as File
 }
 
+/** 构造带 webkitRelativePath 的 File，模拟「选择目录」递归导入。 */
+export function makeDirFile(relativePath: string, bytes = 1): File {
+  const name = relativePath.split('/').pop() ?? relativePath
+  const f = makeFile(name, bytes)
+  Object.defineProperty(f, 'webkitRelativePath', { value: relativePath, configurable: true })
+  return f
+}
+
 export function makeTileRequest(key: string, w = 256, h = 256, file?: File): TileRequest {
   return {
     key,

@@ -192,8 +192,22 @@ describe('Workbench：框选导出原图坐标 JSON', () => {
     wb.pointerUp()
     const parsed = JSON.parse(wb.exportSelection()!.json)
     expect(parsed.level0Tiles).toHaveLength(4)
-    expect(parsed.level0Tiles).toContainEqual({ level: 0, col: 0, row: 0, file: 'l0/0_0.png' })
-    expect(parsed.level0Tiles).toContainEqual({ level: 0, col: 1, row: 1, file: 'l0/1_1.png' })
+    expect(parsed.level0Tiles).toContainEqual({
+      level: 0,
+      col: 0,
+      row: 0,
+      file: 'l0/0_0.png',
+      resolvedFile: '0_0.png',
+      resolvedSize: expect.any(Number)
+    })
+    expect(parsed.level0Tiles).toContainEqual({
+      level: 0,
+      col: 1,
+      row: 1,
+      file: 'l0/1_1.png',
+      resolvedFile: '1_1.png',
+      resolvedSize: expect.any(Number)
+    })
   })
 
   it('反方向拖拽仍导出正宽高且夹在图像范围内', () => {
