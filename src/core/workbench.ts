@@ -18,6 +18,7 @@ import {
 import { TileScheduler } from './scheduler'
 import type { TileRequest } from './decoder'
 import { chooseLevel, visibleSlots, type TileSlot } from './levels'
+import { fileLabel } from './manifest'
 import type {
   DecodeState,
   ImageRect,
@@ -323,7 +324,7 @@ export class Workbench {
         width: round6(rect.width),
         height: round6(rect.height)
       },
-      level0Tiles: tilesForRect(this.manifest, rect)
+      level0Tiles: tilesForRect(this.manifest, rect, this.files)
     }
     return { json: JSON.stringify(payload, null, 2), rect }
   }
@@ -351,19 +352,29 @@ function normalizeRect(r: ImageRect, maxW: number, maxH: number): ImageRect {
 
 function tilesForRect(
   manifest: NormalizedManifest,
-  rect: ImageRect
-): Array<{ level: number; col: number; row: number; file: string | null }> {
+  rect: ImageRect,
+  files: Map<string, File>
+): Array<{ level: number; col: number; row: number; file: string | null; resolvedFile: string | null }> {
   const base = manifest.layers.find((l) => l.level === 0) ?? manifest.layers[0]
   const ts = base.tileSize
   const c0 = Math.max(0, Math.floor(rect.x / ts))
   const r0 = Math.max(0, Math.floor(rect.y / ts))
   const c1 = Math.min(base.cols - 1, Math.floor((rect.x + rect.width) / ts))
   const r1 = Math.min(base.rows - 1, Math.floor((rect.y + rect.height) / ts))
-  const out: Array<{ level: number; col: number; row: number; file: string | null }> = []
+  const out: Array<{ level: number; col: number; row: number; file: string | null; resolvedFile: string | null }> = []
   for (let row = r0; row <= r1; row++) {
     for (let col = c0; col <= c1; col++) {
       const tile = base.tiles.get(`${col}:${row}`)
-      out.push({ level: 0, col, row, file: tile?.file ?? null })
+      const resolved = tile ? files.get(tile.file) ?? null : null
+      // manifest 路径与实际解析到的本地文件同时记录，
+      // 使导出 JSON 能解释画布里真正显示的像素（缺失/歧义时 resolvedFile 为 null）。
+      out.push({
+        level: 0,
+        col,
+        row,
+        file: tile?.file ?? null,
+        resolvedFile: resolved ? fileLabel(resolved) : null
+      })
     }
   }
   return out

@@ -192,8 +192,48 @@ describe('Workbench：框选导出原图坐标 JSON', () => {
     wb.pointerUp()
     const parsed = JSON.parse(wb.exportSelection()!.json)
     expect(parsed.level0Tiles).toHaveLength(4)
-    expect(parsed.level0Tiles).toContainEqual({ level: 0, col: 0, row: 0, file: 'l0/0_0.png' })
-    expect(parsed.level0Tiles).toContainEqual({ level: 0, col: 1, row: 1, file: 'l0/1_1.png' })
+    expect(parsed.level0Tiles).toContainEqual({
+      level: 0,
+      col: 0,
+      row: 0,
+      file: 'l0/0_0.png',
+      resolvedFile: '0_0.png'
+    })
+    expect(parsed.level0Tiles).toContainEqual({
+      level: 0,
+      col: 1,
+      row: 1,
+      file: 'l0/1_1.png',
+      resolvedFile: '1_1.png'
+    })
+  })
+
+  it('导出同时记录实际解析到的本地文件（解释画布显示的像素）；缺失时为 null', () => {
+    const { manifest } = parseManifest(pyramidManifest())
+    // 只提供一块 level 0 瓦片；manifest 路径不变，但 resolvedFile 反映真实归属。
+    const byPath = new Map<string, File>([['l0/0_0.png', makeFile('actual_A.png')]])
+    const decoder = new DelayableDecoder()
+    const scheduler = new TileScheduler({ decoder, maxConcurrency: 4 })
+    const wb = new Workbench({ manifest: manifest!, files: byPath, scheduler })
+    wb.setViewport(800, 600)
+    wb.setTool('select')
+    wb.pointerDown(0, 0, 0, false)
+    wb.pointerMove(2000, 2000)
+    wb.pointerUp()
+
+    const tiles = JSON.parse(wb.exportSelection()!.json).level0Tiles as Array<{
+      col: number
+      row: number
+      file: string
+      resolvedFile: string | null
+    }>
+    const hit = tiles.find((t) => t.col === 0 && t.row === 0)!
+    const miss = tiles.find((t) => t.col === 1 && t.row === 1)!
+    expect(hit.file).toBe('l0/0_0.png')
+    expect(hit.resolvedFile).toBe('actual_A.png')
+    expect(miss.file).toBe('l0/1_1.png')
+    expect(miss.resolvedFile).toBeNull()
+    scheduler.dispose()
   })
 
   it('反方向拖拽仍导出正宽高且夹在图像范围内', () => {

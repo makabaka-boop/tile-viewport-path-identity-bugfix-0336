@@ -77,7 +77,7 @@ async function tryImport(): Promise<void> {
     issues.push({
       severity: 'warning',
       code: 'files.ambiguous',
-      message: `${res.ambiguous.length} 个引用存在同名文件，按缺失处理：${res.ambiguous.slice(0, 4).join(', ')}`
+      message: `${res.ambiguous.length} 个引用匹配到多个本地文件（同名或末尾路径冲突），按缺失处理：${res.ambiguous.slice(0, 4).join(', ')}${res.ambiguous.length > 4 ? ' …' : ''}`
     })
   }
   if (res.unused.length > 0) {

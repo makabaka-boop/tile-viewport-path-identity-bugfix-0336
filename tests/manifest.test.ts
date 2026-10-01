@@ -1,7 +1,7 @@
 import { describe, expect, it } from 'vitest'
 import { normalizeFilePath, parseManifest, resolveFiles } from '../src/core/manifest'
 import type { ManifestJSON } from '../src/core/types'
-import { makeFile } from './helpers'
+import { makeFile, makeRelFile } from './helpers'
 
 function tiles2x2(filePrefix: string): ManifestJSON['layers'][number]['tiles'] {
   // 512×512 图像，256 瓦片 => 2×2
@@ -31,11 +31,27 @@ describe('manifest 路径归一化', () => {
     expect(normalizeFilePath('a/b\\c.png')).toBe('a/b/c.png')
     expect(normalizeFilePath('./x.png')).toBe('x.png')
   })
-  it('拒绝绝对路径与 .. 越界', () => {
+  it('折叠所有 . 片段，保证等价目录片段归一为同一路径', () => {
+    expect(normalizeFilePath('a/./b.png')).toBe('a/b.png')
+    expect(normalizeFilePath('././x.png')).toBe('x.png')
+    expect(normalizeFilePath('a/b/.')).toBe('a/b')
+    expect(normalizeFilePath('.')).toBeNull()
+    expect(normalizeFilePath('./')).toBeNull()
+  })
+  it('拒绝绝对路径、.. 越界与空片段', () => {
     expect(normalizeFilePath('/etc/passwd')).toBeNull()
     expect(normalizeFilePath('../x.png')).toBeNull()
     expect(normalizeFilePath('a/../b.png')).toBeNull()
+    expect(normalizeFilePath('a//b.png')).toBeNull()
     expect(normalizeFilePath('')).toBeNull()
+  })
+  it('等价目录片段不能绕过文件名唯一性检查', () => {
+    const m = validManifest()
+    // 第二块瓦片用 ./L0/0_0.png 等 Price 写法引用同一文件
+    m.layers[0].tiles[1] = { col: 1, row: 0, file: './L0/./0_0.png' }
+    const r = parseManifest(m)
+    expect(r.manifest).toBeNull()
+    expect(r.issues.some((i) => i.code === 'tile.duplicate_file')).toBe(true)
   })
 })
 
@@ -177,5 +193,56 @@ describe('本地文件解析（不上传内容）', () => {
     expect(res.byPath.size).toBe(5)
     expect(res.missing).toEqual([])
     expect(res.unused).toEqual(['random.txt'])
+  })
+
+  it('两套末尾路径相同的瓦片：后缀冲突一律歧义，结果与文件顺序无关', () => {
+    const m = validManifest()
+    // 清单只引用 4 个 L0 瓦片（L0/0_0.png …）
+    m.layers[1].tiles = [{ col: 0, row: 0, file: 'overview.png' }]
+    const { manifest } = parseManifest(m)
+
+    // 从同一父目录导入 A、B 两套瓦片，二者末尾路径完全相同。
+    const setA = ['L0/0_0.png', 'L0/0_1.png', 'L0/1_0.png', 'L0/1_1.png', 'overview.png'].map((p) =>
+      makeRelFile(`shootA/tiles/${p}`)
+    )
+    const setB = ['L0/0_0.png', 'L0/0_1.png', 'L0/1_0.png', 'L0/1_1.png', 'overview.png'].map((p) =>
+      makeRelFile(`shootB/tiles/${p}`)
+    )
+
+    const resolve = (files: File[]) => {
+      const r = resolveFiles(manifest!, files)
+      return {
+        resolved: [...r.byPath.entries()].sort(([a], [b]) => a.localeCompare(b)),
+        missing: [...r.missing].sort(),
+        ambiguous: [...r.ambiguous].sort(),
+        unused: [...r.unused].sort()
+      }
+    }
+
+    const forward = resolve([...setA, ...setB])
+    const reversed = resolve([...setB, ...setA])
+
+    // 无论浏览器先返回哪一套，任何引用都不得静默归属到其中一套。
+    expect(forward.resolved).toEqual([])
+    expect(forward.ambiguous).toEqual(['L0/0_0.png', 'L0/0_1.png', 'L0/1_0.png', 'L0/1_1.png', 'overview.png'])
+    expect(forward.missing).toEqual(forward.ambiguous)
+    expect(reversed).toEqual(forward)
+
+    // 两套文件都「参与了歧义」，不产生随顺序互换的多余文件告警。
+    expect(forward.unused).toEqual([])
+  })
+
+  it('单套目录选择仍按相对路径后缀正常归属', () => {
+    const m = validManifest()
+    const { manifest } = parseManifest(m)
+    const files = [
+      ...['0_0.png', '0_1.png', '1_0.png', '1_1.png'].map((n) => makeRelFile(`shoot/tiles/L0/${n}`)),
+      makeRelFile('shoot/tiles/L1/0_0.png')
+    ]
+    const res = resolveFiles(manifest!, files)
+    expect(res.byPath.size).toBe(5)
+    expect(res.missing).toEqual([])
+    expect(res.ambiguous).toEqual([])
+    expect(res.unused).toEqual([])
   })
 })

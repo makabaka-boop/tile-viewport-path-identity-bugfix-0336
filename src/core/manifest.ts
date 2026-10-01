@@ -24,14 +24,18 @@ function isInt(v: unknown): v is number {
   return typeof v === 'number' && Number.isInteger(v)
 }
 
-/** 将 manifest 中的路径归一化为相对、正斜杠形式；绝对路径 / `..` 越界返回 null。 */
+/**
+ * 将 manifest 中的路径归一化为相对、正斜杠形式；绝对路径 / `..` 越界返回 null。
+ * 所有「.」片段都会被折叠（./a、a/./b、././a 与 a/b 视为同一文件），
+ * 空片段（a//b）同样拒绝，确保归一化结果可用于全局唯一性判断。
+ */
 export function normalizeFilePath(raw: string): string | null {
-  const p = raw.replace(/\\/g, '/').replace(/^\.\//, '')
+  const p = raw.replace(/\\/g, '/')
   if (p.length === 0) return null
   if (p.startsWith('/')) return null
-  const parts = p.split('/')
-  if (parts.some((seg) => seg === '..')) return null
-  if (parts.some((seg) => seg.length === 0)) return null
+  const parts = p.split('/').filter((seg) => seg !== '.')
+  if (parts.length === 0) return null
+  if (parts.some((seg) => seg === '..' || seg.length === 0)) return null
   return parts.join('/')
 }
 
@@ -274,9 +278,12 @@ export interface ResolvedFiles {
   byPath: Map<string, File>
   /** 被引用但未在所选文件中找到的路径（查看器显示占位）。 */
   missing: string[]
-  /** basename 匹配到多个文件、无法确定的引用路径。 */
+  /**
+   * 同一引用后缀对应多个不同文件、或多个引用无法用路径消歧的路径。
+   * 结果与浏览器返回文件的顺序无关；命中歧义的引用按缺失处理。
+   */
   ambiguous: string[]
-  /** 已选择但未被任何瓦片引用的文件名。 */
+  /** 已选择但无法对应任何引用的文件标签（目录选择时为相对路径）。 */
   unused: string[]
 }
 
@@ -285,28 +292,45 @@ function webkitRelativePathOf(f: File): string {
   return typeof rel === 'string' ? rel.replace(/\\/g, '/') : ''
 }
 
+/** 文件的展示标签：优先使用目录选择产生的相对路径，否则退回 basename。 */
+export function fileLabel(f: File): string {
+  return webkitRelativePathOf(f) || f.name
+}
+
 /**
  * 将归一化 manifest 引用的路径解析到用户选择的本地文件。绝不读取文件内容，
  * 仅按相对路径 / 文件名匹配。缺失条目以 missing 路径返回（查看器显示占位）。
+ *
+ * 解析结果必须与 `files` 的排列顺序无关：当同一引用后缀能匹配到多个不同文件
+ * （例如从同一父目录导入两套末尾路径相同的瓦片）时，绝不静默取其中一个，
+ * 而是将该引用记入 ambiguous 并按缺失处理，两套文件都不参与像素归属。
  */
 export function resolveFiles(manifest: NormalizedManifest, files: File[]): ResolvedFiles {
   const referenced = new Set<string>()
   manifest.layers.forEach((l) => l.tiles.forEach((t) => referenced.add(t.file)))
 
   // 以「相对路径后缀」索引（兼容目录选择产生的 webkitRelativePath），再以 basename 兜底。
-  const byRel = new Map<string, File>()
+  // 同一后缀保留全部不同的候选文件；候选数 > 1 即构成歧义，不做先到先得的选择。
+  const suffixCandidates = new Map<string, File[]>()
   const byBase = new Map<string, File[]>()
+  const register = (key: string, f: File): void => {
+    const list = suffixCandidates.get(key)
+    if (!list) {
+      suffixCandidates.set(key, [f])
+    } else if (!list.includes(f)) {
+      list.push(f)
+    }
+  }
   for (const f of files) {
     const rel = webkitRelativePathOf(f)
     if (rel) {
       const parts = rel.split('/')
       // a/b/c.png 注册 b/c.png 与 c.png 两个后缀
       for (let idx = 1; idx < parts.length; idx++) {
-        const suffix = parts.slice(idx).join('/')
-        if (!byRel.has(suffix)) byRel.set(suffix, f)
+        register(parts.slice(idx).join('/'), f)
       }
     }
-    if (!byRel.has(f.name)) byRel.set(f.name, f)
+    register(f.name, f)
 
     const list = byBase.get(f.name)
     if (list) list.push(f)
@@ -316,11 +340,23 @@ export function resolveFiles(manifest: NormalizedManifest, files: File[]): Resol
   const byPath = new Map<string, File>()
   const missing: string[] = []
   const ambiguous: string[] = []
+  /** 因歧义涉及的文件：它们不能算作「多余文件」，只是归属无法确定。 */
+  const involved = new Set<File>()
+  /** 第一轮已判定（唯一命中或歧义）的引用，第二轮 basename 兜底不再处理。 */
+  const suffixDecided = new Set<string>()
 
-  // 第一轮：相对路径后缀精确匹配。
+  // 第一轮：相对路径后缀匹配。候选唯一才归属；多个不同文件 => 歧义。
   for (const ref of referenced) {
-    const exact = byRel.get(ref)
-    if (exact) byPath.set(ref, exact)
+    const candidates = suffixCandidates.get(ref)
+    if (!candidates || candidates.length === 0) continue
+    suffixDecided.add(ref)
+    if (candidates.length === 1) {
+      byPath.set(ref, candidates[0])
+    } else {
+      ambiguous.push(ref)
+      missing.push(ref)
+      candidates.forEach((f) => involved.add(f))
+    }
   }
 
   // 第二轮：仅对未命中的引用做 basename 兜底。
@@ -332,16 +368,14 @@ export function resolveFiles(manifest: NormalizedManifest, files: File[]): Resol
   }
 
   for (const ref of referenced) {
-    if (byPath.has(ref)) continue
+    if (byPath.has(ref) || suffixDecided.has(ref)) continue
     const base = ref.split('/').pop() ?? ref
     const candidates = byBase.get(base) ?? []
-    if ((baseRefCount.get(base) ?? 0) > 1) {
+    if ((baseRefCount.get(base) ?? 0) > 1 || candidates.length > 1) {
       ambiguous.push(ref)
       missing.push(ref)
+      candidates.forEach((f) => involved.add(f))
     } else if (candidates.length === 0) {
-      missing.push(ref)
-    } else if (candidates.length > 1) {
-      ambiguous.push(ref)
       missing.push(ref)
     } else {
       byPath.set(ref, candidates[0])
@@ -349,7 +383,12 @@ export function resolveFiles(manifest: NormalizedManifest, files: File[]): Resol
   }
 
   const usedFiles = new Set<File>(byPath.values())
-  const unused = files.filter((f) => !usedFiles.has(f)).map((f) => f.name)
+  // 已归属（used）或参与歧义匹配（involved）的文件都不是多余文件；
+  // 既未唯一命中、也未参与任何歧义的文件才真正未被 manifest 引用。
+  // 结果只取决于文件集合，与浏览器返回文件的顺序无关。
+  const unused = files
+    .filter((f) => !usedFiles.has(f) && !involved.has(f))
+    .map((f) => fileLabel(f))
 
   return { byPath, missing, ambiguous, unused }
 }
